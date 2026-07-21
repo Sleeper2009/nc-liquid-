@@ -12,19 +12,31 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Theos
-        uses: theos/actions/install@master
-        with:
-          version: latest
+      - name: Clone Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Install iOS SDK
-        uses: theos/actions/sdk@master
-        with:
-          version: "16.5"
+      - name: Get iOS SDK
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv iPhoneOS16.5.sdk $HOME/theos/sdks/
+          cd ..
+          rm -rf sdks
+
+      - name: Install ldid
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot
+          curl -L -o /usr/local/bin/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          chmod +x /usr/local/bin/ldid
 
       - name: Build package
         env:
-          THEOS: ${{ github.workspace }}/theos
+          THEOS: /home/runner/theos
         run: |
           make package FINALPACKAGE=1
 
