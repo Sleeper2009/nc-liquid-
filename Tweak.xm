@@ -13,6 +13,26 @@
 #import <QuartzCore/QuartzCore.h>
 
 // ---------------------------------------------------------------------
+// Minimal stub interfaces for SpringBoard's private classes.
+//
+// We don't have Apple's real private headers for these, so the compiler
+// only knows about them as opaque forward-declared types unless we tell
+// it what they inherit from. Declaring them here as plain UIView /
+// UIViewController subclasses is enough for %hook, %property, and
+// %orig to work correctly — we're not redefining Apple's real class,
+// just describing its public shape (superclass) so Logos can generate
+// valid code against it.
+//
+// Adjust the superclass/name here to match whatever class you found
+// via class-dump for your target iOS version.
+// ---------------------------------------------------------------------
+@interface CSCoverSheetView : UIView
+@end
+
+@interface CSCoverSheetViewController : UIViewController
+@end
+
+// ---------------------------------------------------------------------
 // Helper: builds the "glass" layer stack — blur, vibrancy tint,
 // a moving specular highlight, and a continuous-corner mask.
 // ---------------------------------------------------------------------
@@ -32,15 +52,11 @@
 		self.clipsToBounds = YES;
 		self.layer.masksToBounds = YES;
 
-		// Subtle tint so content behind isn't washed out — mimics
-		// Liquid Glass's "Clear" vs "Tinted" balance.
 		UIView *tint = [[UIView alloc] initWithFrame:self.bounds];
 		tint.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
 		tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 		[self.contentView addSubview:tint];
 
-		// Specular highlight: a soft diagonal gradient that sweeps
-		// across the glass, like light catching a curved edge.
 		CAGradientLayer *spec = [CAGradientLayer layer];
 		spec.frame = self.bounds;
 		spec.colors = @[
@@ -59,8 +75,6 @@
 	return self;
 }
 
-// Slow ambient sweep so the glass never looks static — same idea as
-// Apple's Liquid Glass reacting subtly even without touch input.
 - (void)animateSpecularSweep {
 	CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"locations"];
 	anim.fromValue = @[@-0.2, @-0.05, @0.1];
@@ -72,9 +86,6 @@
 	[self.specularLayer addAnimation:anim forKey:@"sweep"];
 }
 
-// Call this from the pan/scroll delegate while the user is dragging the
-// shade down — it stretches the corner radius and highlight slightly,
-// echoing Liquid Glass's "gathering" behaviour under touch.
 - (void)updateForPullProgress:(CGFloat)progress {
 	progress = MAX(0.0, MIN(1.0, progress));
 	self.layer.cornerRadius = 44.0 + (progress * 10.0);
