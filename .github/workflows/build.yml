@@ -2,27 +2,57 @@ name: Build LiquidGlassNC
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [main, master]
+  workflow_dispatch: {}
 
 jobs:
   build:
+    name: Build .deb
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Theos
-        uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: theos
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl git perl libplist-utils
+
+      - name: Install Theos
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          sudo apt-get install -y libtinfo6 || sudo apt-get install -y libtinfo5 || true
+
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+          mkdir -p "$THEOS/sdks"
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/*.sdk "$THEOS/sdks/"
+          rm -rf master.zip sdks-master
+
+          mkdir -p "$THEOS/toolchain/"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJf - -C "$THEOS/toolchain/"
 
       - name: Build package
+        env:
+          THEOS: ${{ github.workspace }}/theos
         run: |
+          export PATH="$THEOS/bin:$THEOS/toolchain/linux/iphone/bin:$PATH"
           make package FINALPACKAGE=1
 
-      - name: Upload .deb artifact
+      - name: Find built .deb
+        id: find_deb
+        run: |
+          DEB_PATH=$(find packages -name "*.deb" | head -n1)
+          echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
+          echo "Đã build xong: $DEB_PATH"
+
+      - name: Upload .deb as artifact
         uses: actions/upload-artifact@v4
         with:
           name: LiquidGlassNC-deb
-          path: packages/*.deb
+          path: ${{ steps.find_deb.outputs.deb_path }}
+          if-no-files-found: error
