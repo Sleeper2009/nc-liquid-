@@ -1,9 +1,9 @@
 Package: com.yourname.liquidglassnc
 Name: LiquidGlassNC
 Version: 1.0.0
-Architecture: iphoneos-arm
+Architecture: iphoneos-arm64
 Description: Recreates an iOS 26-style "Liquid Glass" pull-down effect on the Notification Center for older jailbroken iOS versions.
 Maintainer: Your Name
 Author: Your Name
 Section: Tweaks
-Depends: mobilesubstrate, firmware (>= 14.0)
+Depends: mobilesubstrate, firmware (>= 15.0)
