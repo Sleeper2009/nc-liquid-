@@ -15,16 +15,7 @@
 #import <objc/runtime.h>
 
 // ---------------------------------------------------------------------
-// Tiny file logger.
-//
-// Writes timestamped lines to /var/mobile/Documents/LiquidGlassNC.log
-// so you can check what happened even without a live syslog session.
-// This path lives outside the rootless prefix (/var/jb) so it's
-// reachable the same way on both rootful and rootless jailbreaks, and
-// is easy to grab with Filza or `scp`.
-//
-// View it with: tail -f /var/mobile/Documents/LiquidGlassNC.log
-// (over SSH), or open it in Filza / a text editor app.
+// Tiny file logger. See /var/mobile/Documents/LiquidGlassNC.log
 // ---------------------------------------------------------------------
 static NSString * const kLGLogPath = @"/var/mobile/Documents/LiquidGlassNC.log";
 
@@ -58,17 +49,8 @@ static void LGLog(NSString *format, ...) {
 
 // ---------------------------------------------------------------------
 // Minimal stub interfaces for SpringBoard's private classes.
-//
-// We don't have Apple's real private headers for these, so the compiler
-// only knows about them as opaque forward-declared types unless we tell
-// it what they inherit from. Declaring them here as plain UIView /
-// UIViewController subclasses is enough for %hook and %orig to work
-// correctly — we're not redefining Apple's real class, just describing
-// its public shape (superclass) so Logos can generate valid code
-// against it.
-//
-// Adjust the superclass/name here to match whatever class you found
-// via class-dump for your target iOS version.
+// Adjust the superclass/name here to match whatever class you find via
+// class-dump for your target iOS version.
 // ---------------------------------------------------------------------
 @interface CSCoverSheetView : UIView
 @end
@@ -77,34 +59,34 @@ static void LGLog(NSString *format, ...) {
 @end
 
 // ---------------------------------------------------------------------
-// LGGlassView — real refraction, not just blur.
+// LGGlassView
 //
-// Technique: same two-stage idea used by open-source glass libraries
-// like BarredEwe/LiquidGlass and DnV1eX/LiquidGlassKit (capture what's
-// behind the view, then distort/refract that captured image) — but
-// reimplemented with CoreImage's built-in CIGlassDistortion filter
-// instead of a custom Metal shader. Those libraries compile .metal
-// shaders via Xcode's Metal compiler, which isn't available on a Linux
-// GitHub Actions runner, so this version trades a little visual
-// fidelity for something that actually builds in this CI setup.
-//
-// Stages:
-//   1. Snapshot whatever is behind this view (drawViewHierarchyInRect:)
-//   2. Generate a soft, cloud-like displacement/bump texture
-//   3. Run CIGlassDistortion(background, bump) to warp the snapshot
-//   4. Composite the result as this view's layer contents, then add a
-//      tint + ambient specular sweep on top (same as before) for the
-//      "polish" pass.
-//
-// The background is captured once per meaningful layout change rather
-// than every frame — full CoreImage passes are too expensive to redo
-// on every pan-gesture tick, and the shade's background (wallpaper /
-// lock screen) is static anyway, so a static refracted snapshot reads
-// as "real" glass without a live per-frame cost.
+// Architecture (per your requirements):
+//  - The background capture + CIGlassDistortion pass is EXPENSIVE, so
+//    it only runs: once on attach, once on real size changes, and once
+//    every ~1s on a timer (to track the clock etc). It never runs on
+//    every pan-gesture tick.
+//  - Two pre-rendered layers are kept around:
+//      baseLayer  — brightened, UNDISTORTED capture (the "clear middle"
+//                   of the glass)
+//      edgeLayer  — brightened, DISTORTED capture (only visible near
+//                   the border, via a soft ring-shaped mask)
+//  - During a pull gesture, updateForPullProgress: only touches cheap
+//    CALayer properties (cornerRadius, an overlay's opacity) — pure
+//    GPU compositing, so it can run at native display refresh rate.
+//  - Liquid Glass lifts the content behind it rather than darkening it,
+//    so we boost brightness/saturation slightly instead of tinting
+//    with a translucent dark/white overlay.
 // ---------------------------------------------------------------------
 @interface LGGlassView : UIView
-@property (nonatomic, strong) CAGradientLayer *specularLayer;
-@property (nonatomic, strong) UIView *tintView;
+@property (nonatomic, strong) CALayer *baseLayer;
+@property (nonatomic, strong) CALayer *edgeLayer;
+@property (nonatomic, strong) CALayer *highlightLayer;
+@property (nonatomic, strong) NSTimer *refreshTimer;
+@property (nonatomic, assign) NSTimeInterval lastRefreshTime;
+@property (nonatomic, assign) CGSize lastMaskSize;
+@property (nonatomic, assign) CGFloat baseCornerRadius;
+@property (nonatomic, assign) CGFloat edgeWidth;
 @end
 
 @implementation LGGlassView
@@ -112,57 +94,77 @@ static void LGLog(NSString *format, ...) {
 - (instancetype)initWithFrame:(CGRect)frame {
 	self = [super initWithFrame:frame];
 	if (self) {
+		self.baseCornerRadius = 30.0; // was 45 — reduced per request
+		self.edgeWidth = 28.0;        // width of the "liquid pouch" rim, ~25-30pt
+		self.lastMaskSize = CGSizeZero;
+		self.lastRefreshTime = 0;
+
 		self.layer.cornerCurve = kCACornerCurveContinuous;
-		self.layer.cornerRadius = 44.0;
+		self.layer.cornerRadius = self.baseCornerRadius;
 		self.clipsToBounds = YES;
 		self.layer.masksToBounds = YES;
 		self.userInteractionEnabled = NO;
-		// Fallback color shown before the first snapshot resolves.
-		self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.6];
+		self.backgroundColor = [UIColor clearColor];
 
-		UIView *tint = [[UIView alloc] initWithFrame:self.bounds];
-		tint.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
-		tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-		tint.userInteractionEnabled = NO;
-		[self addSubview:tint];
-		self.tintView = tint;
+		self.baseLayer = [CALayer layer];
+		self.baseLayer.frame = self.bounds;
+		self.baseLayer.contentsGravity = kCAGravityResizeAspectFill;
+		[self.layer addSublayer:self.baseLayer];
 
-		CAGradientLayer *spec = [CAGradientLayer layer];
-		spec.frame = self.bounds;
-		spec.colors = @[
-			(id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor,
-			(id)[UIColor colorWithWhite:1.0 alpha:0.22].CGColor,
-			(id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor
-		];
-		spec.locations = @[@0.35, @0.5, @0.65];
-		spec.startPoint = CGPointMake(0.0, 0.0);
-		spec.endPoint = CGPointMake(1.0, 1.0);
-		[self.layer addSublayer:spec];
-		self.specularLayer = spec;
+		self.edgeLayer = [CALayer layer];
+		self.edgeLayer.frame = self.bounds;
+		self.edgeLayer.contentsGravity = kCAGravityResizeAspectFill;
+		[self.layer addSublayer:self.edgeLayer];
 
-		[self animateSpecularSweep];
+		// Subtle brightening overlay near the rim, strengthened as the
+		// user pulls further — "the covered area gets brighter, not
+		// darker."
+		self.highlightLayer = [CALayer layer];
+		self.highlightLayer.frame = self.bounds;
+		self.highlightLayer.backgroundColor = [UIColor whiteColor].CGColor;
+		self.highlightLayer.opacity = 0.05;
+		[self.layer addSublayer:self.highlightLayer];
 	}
 	return self;
 }
 
-- (void)animateSpecularSweep {
-	CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"locations"];
-	anim.fromValue = @[@-0.2, @-0.05, @0.1];
-	anim.toValue = @[@0.9, @1.05, @1.2];
-	anim.duration = 6.0;
-	anim.autoreverses = YES;
-	anim.repeatCount = HUGE_VALF;
-	anim.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-	[self.specularLayer addAnimation:anim forKey:@"sweep"];
+- (void)layoutSubviews {
+	[super layoutSubviews];
+	self.baseLayer.frame = self.bounds;
+	self.edgeLayer.frame = self.bounds;
+	self.highlightLayer.frame = self.bounds;
 }
 
+- (void)didMoveToWindow {
+	[super didMoveToWindow];
+	if (self.window) {
+		[self startRefreshTimer];
+		[self refreshGlassBackground];
+	} else {
+		[self stopRefreshTimer];
+	}
+}
+
+- (void)startRefreshTimer {
+	[self stopRefreshTimer];
+	__weak typeof(self) weakSelf = self;
+	self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+		[weakSelf refreshGlassBackground];
+	}];
+}
+
+- (void)stopRefreshTimer {
+	[self.refreshTimer invalidate];
+	self.refreshTimer = nil;
+}
+
+// Cheap, called on every pan-gesture tick — no image work here.
 - (void)updateForPullProgress:(CGFloat)progress {
 	progress = MAX(0.0, MIN(1.0, progress));
-	self.layer.cornerRadius = 44.0 + (progress * 10.0);
-	self.specularLayer.opacity = 0.6 + (progress * 0.4);
+	self.layer.cornerRadius = self.baseCornerRadius + (progress * 6.0);
+	self.highlightLayer.opacity = 0.05 + (progress * 0.22);
 }
 
-// Shared CoreImage context — expensive to create, so build it once.
 + (CIContext *)sharedContext {
 	static CIContext *ctx;
 	static dispatch_once_t token;
@@ -172,9 +174,7 @@ static void LGLog(NSString *format, ...) {
 	return ctx;
 }
 
-// A soft, cloud-like grayscale texture used as the displacement map
-// for CIGlassDistortion. Random noise, heavily blurred, gives smooth
-// "waves" in the refraction rather than sharp/glittery artifacts.
+// Soft, cloud-like displacement map for CIGlassDistortion.
 + (CIImage *)bumpTextureForSize:(CGSize)size {
 	CIFilter *random = [CIFilter filterWithName:@"CIRandomGenerator"];
 	CIImage *noise = random.outputImage;
@@ -189,11 +189,65 @@ static void LGLog(NSString *format, ...) {
 	return [blurred imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
 }
 
-// Captures whatever is behind this view, runs it through
-// CIGlassDistortion, and sets the result as this layer's contents.
+// Builds a soft "picture frame" ring mask: opaque near the border,
+// fading to transparent by `edgeWidth` into the panel. Used so the
+// distorted edgeLayer only shows through near the rim while the middle
+// reveals the clear (undistorted) baseLayer underneath.
++ (UIImage *)frameMaskImageForSize:(CGSize)size cornerRadius:(CGFloat)cornerRadius edgeWidth:(CGFloat)edgeWidth scale:(CGFloat)scale {
+	if (size.width < 1 || size.height < 1) return nil;
+
+	UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+	format.opaque = NO;
+	format.scale = scale;
+	UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+
+	UIImage *hardRing = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull rendererContext) {
+		CGContextRef ctx = rendererContext.CGContext;
+		UIBezierPath *outer = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size.width, size.height) cornerRadius:cornerRadius];
+		[[UIColor whiteColor] setFill];
+		[outer fill];
+
+		CGRect innerRect = CGRectInset(CGRectMake(0, 0, size.width, size.height), edgeWidth, edgeWidth);
+		if (innerRect.size.width > 0 && innerRect.size.height > 0) {
+			CGFloat innerRadius = MAX(cornerRadius - edgeWidth, 0);
+			UIBezierPath *inner = [UIBezierPath bezierPathWithRoundedRect:innerRect cornerRadius:innerRadius];
+			CGContextSetBlendMode(ctx, kCGBlendModeDestinationOut);
+			[[UIColor blackColor] setFill];
+			[inner fill];
+			CGContextSetBlendMode(ctx, kCGBlendModeNormal);
+		}
+	}];
+
+	// Soften the hard ring edge so the transition into the clear middle
+	// isn't a visible seam.
+	CIImage *ciRing = [CIImage imageWithCGImage:hardRing.CGImage];
+	CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+	[blur setValue:ciRing forKey:kCIInputImageKey];
+	[blur setValue:@(MAX(edgeWidth * 0.3, 4.0)) forKey:kCIInputRadiusKey];
+	CIImage *blurred = blur.outputImage;
+	if (!blurred) return hardRing;
+
+	CGRect extent = CGRectMake(0, 0, size.width * scale, size.height * scale);
+	CGImageRef cg = [[LGGlassView sharedContext] createCGImage:blurred fromRect:extent];
+	if (!cg) return hardRing;
+	UIImage *softMask = [UIImage imageWithCGImage:cg scale:scale orientation:UIImageOrientationUp];
+	CGImageRelease(cg);
+	return softMask;
+}
+
+// The expensive pass: capture what's behind this view, brighten it,
+// produce both an undistorted and a glass-distorted version, and store
+// them as static layer contents for cheap reuse every frame.
 - (void)refreshGlassBackground {
+	NSTimeInterval now = CACurrentMediaTime();
+	if (now - self.lastRefreshTime < 0.1) return; // debounce duplicate calls
+	self.lastRefreshTime = now;
+
 	UIView *source = self.superview;
-	if (!source || self.bounds.size.width < 1 || self.bounds.size.height < 1) return;
+	if (!source || self.bounds.size.width < 1 || self.bounds.size.height < 1) {
+		LGLog(@"[LGGlassView] refresh skipped — no superview or zero size");
+		return;
+	}
 
 	CGRect frameInSource = self.frame;
 	BOOL wasHidden = self.hidden;
@@ -210,10 +264,11 @@ static void LGLog(NSString *format, ...) {
 	}];
 	self.hidden = wasHidden;
 
-	if (!snapshot.CGImage) return;
+	if (!snapshot.CGImage) {
+		LGLog(@"[LGGlassView] refresh failed — snapshot had no CGImage (likely capturing the wrong window)");
+		return;
+	}
 
-	// UIKit's origin is top-left; CoreImage's is bottom-left, so flip
-	// the crop rect's Y before cropping the captured CIImage.
 	CGRect cropRect = CGRectMake(
 		frameInSource.origin.x * scale,
 		(source.bounds.size.height - frameInSource.origin.y - frameInSource.size.height) * scale,
@@ -223,36 +278,67 @@ static void LGLog(NSString *format, ...) {
 
 	CIImage *full = [CIImage imageWithCGImage:snapshot.CGImage];
 	CIImage *cropped = [full imageByCroppingToRect:cropRect];
-	CIImage *bump = [LGGlassView bumpTextureForSize:cropRect.size];
-	if (!bump) return;
 
-	CIFilter *distortion = [CIFilter filterWithName:@"CIGlassDistortion"];
-	if (!distortion) {
-		// CIGlassDistortion unavailable on this iOS version — fall back
-		// to a plain (undistorted) blurred snapshot so the tweak still
-		// shows *something* rather than a blank layer.
-		CIFilter *fallbackBlur = [CIFilter filterWithName:@"CIGaussianBlur"];
-		[fallbackBlur setValue:cropped forKey:kCIInputImageKey];
-		[fallbackBlur setValue:@(18.0) forKey:kCIInputRadiusKey];
-		[self renderCIImage:[fallbackBlur.outputImage imageByCroppingToRect:cropRect] rect:cropRect scale:scale];
-		return;
+	// Liquid Glass LIFTS what's behind it — brighten, don't darken.
+	CIFilter *brighten = [CIFilter filterWithName:@"CIColorControls"];
+	[brighten setValue:cropped forKey:kCIInputImageKey];
+	[brighten setValue:@(0.08) forKey:kCIInputBrightnessKey];
+	[brighten setValue:@(1.03) forKey:kCIInputSaturationKey];
+	[brighten setValue:@(1.0) forKey:kCIInputContrastKey];
+	CIImage *brightened = brighten.outputImage ?: cropped;
+
+	// Base layer: clear middle — brightened, NOT distorted.
+	CGImageRef baseCG = [[LGGlassView sharedContext] createCGImage:brightened fromRect:cropRect];
+	if (baseCG) {
+		self.baseLayer.contents = (__bridge id)baseCG;
+		self.baseLayer.contentsScale = scale;
+		CGImageRelease(baseCG);
 	}
 
-	[distortion setValue:cropped forKey:kCIInputImageKey];
-	[distortion setValue:bump forKey:@"inputTexture"];
-	[distortion setValue:[CIVector vectorWithX:CGRectGetMidX(cropRect) Y:CGRectGetMidY(cropRect)] forKey:kCIInputCenterKey];
-	[distortion setValue:@(55.0) forKey:kCIInputScaleKey]; // distortion strength — raise for a "wavier" look
+	// Edge layer: same image, glass-distorted — only shown near the rim.
+	CIImage *edgeOutput = brightened;
+	CIImage *bump = [LGGlassView bumpTextureForSize:cropRect.size];
+	if (bump) {
+		CIFilter *distortion = [CIFilter filterWithName:@"CIGlassDistortion"];
+		if (distortion) {
+			[distortion setValue:brightened forKey:kCIInputImageKey];
+			[distortion setValue:bump forKey:@"inputTexture"];
+			[distortion setValue:[CIVector vectorWithX:CGRectGetMidX(cropRect) Y:CGRectGetMidY(cropRect)] forKey:kCIInputCenterKey];
+			[distortion setValue:@(60.0) forKey:kCIInputScaleKey];
+			edgeOutput = distortion.outputImage ?: brightened;
+		} else {
+			LGLog(@"[LGGlassView] CIGlassDistortion unavailable on this iOS version — edge will look clear, not warped");
+		}
+	}
+	CGImageRef edgeCG = [[LGGlassView sharedContext] createCGImage:edgeOutput fromRect:cropRect];
+	if (edgeCG) {
+		self.edgeLayer.contents = (__bridge id)edgeCG;
+		self.edgeLayer.contentsScale = scale;
+		CGImageRelease(edgeCG);
+	}
 
-	[self renderCIImage:distortion.outputImage rect:cropRect scale:scale];
-}
+	// Rebuild the rim mask only when the size actually changed.
+	if (!CGSizeEqualToSize(self.lastMaskSize, self.bounds.size)) {
+		UIImage *mask = [LGGlassView frameMaskImageForSize:self.bounds.size
+		                                        cornerRadius:self.baseCornerRadius
+		                                           edgeWidth:self.edgeWidth
+		                                               scale:scale];
+		if (mask) {
+			CALayer *edgeMask = [CALayer layer];
+			edgeMask.frame = self.bounds;
+			edgeMask.contents = (__bridge id)mask.CGImage;
+			self.edgeLayer.mask = edgeMask;
 
-- (void)renderCIImage:(CIImage *)image rect:(CGRect)rect scale:(CGFloat)scale {
-	if (!image) return;
-	CGImageRef output = [[LGGlassView sharedContext] createCGImage:image fromRect:rect];
-	if (!output) return;
-	self.layer.contents = (__bridge id)output;
-	self.layer.contentsScale = scale;
-	CGImageRelease(output);
+			CALayer *highlightMask = [CALayer layer];
+			highlightMask.frame = self.bounds;
+			highlightMask.contents = (__bridge id)mask.CGImage;
+			self.highlightLayer.mask = highlightMask;
+
+			self.lastMaskSize = self.bounds.size;
+		} else {
+			LGLog(@"[LGGlassView] failed to build rim mask");
+		}
+	}
 }
 
 @end
@@ -260,15 +346,6 @@ static void LGLog(NSString *format, ...) {
 // ---------------------------------------------------------------------
 // Hook: inject the glass view behind the notification shade's content,
 // and drive updateForPullProgress: from the shade's own pan gesture.
-//
-// We use an associated object (via objc/runtime.h) instead of a Logos
-// %property here. %property needs to generate a real property on the
-// hooked class, which runs into trouble when we only have a stub
-// @interface (no real private headers) — the associated object
-// approach sidesteps that entirely and always compiles.
-//
-// Replace `CSCoverSheetView` below with the actual class name you find
-// via class-dump for your target iOS version.
 // ---------------------------------------------------------------------
 static char kLGGlassViewKey;
 
@@ -283,12 +360,6 @@ static char kLGGlassViewKey;
 		[self insertSubview:glass atIndex:0];
 		objc_setAssociatedObject(self, &kLGGlassViewKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 		LGLog(@"[CSCoverSheetView] glass view attached, frame=%@", NSStringFromCGRect(self.bounds));
-
-		// Defer to the next runloop tick so the view hierarchy has
-		// settled before we snapshot + distort what's behind us.
-		dispatch_async(dispatch_get_main_queue(), ^{
-			[glass refreshGlassBackground];
-		});
 	}
 }
 
@@ -297,22 +368,16 @@ static char kLGGlassViewKey;
 	LGGlassView *glass = objc_getAssociatedObject(self, &kLGGlassViewKey);
 	CGSize previousSize = glass.bounds.size;
 	glass.frame = self.bounds;
-
-	// Re-run the (expensive) CoreImage distortion only when the size
-	// actually changed — not on every position/alpha update during a
-	// pull gesture.
 	if (glass && !CGSizeEqualToSize(previousSize, glass.bounds.size)) {
-		dispatch_async(dispatch_get_main_queue(), ^{
-			[glass refreshGlassBackground];
-		});
+		[glass refreshGlassBackground];
 	}
 }
 
 %end
 
-// Drive the stretch effect from the shade's pan gesture recognizer.
-// SBDashBoardViewController (or its 17+ equivalent) typically owns the
-// gesture; hook wherever the "percent revealed" value is computed.
+// Drive the rim highlight + corner-radius reaction from the shade's own
+// pan gesture. This is cheap (see updateForPullProgress: above), so it's
+// safe to call on every tick.
 %hook CSCoverSheetViewController
 
 - (void)_updateRevealPercent:(CGFloat)percent {
