@@ -11,6 +11,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 
 // ---------------------------------------------------------------------
 // Minimal stub interfaces for SpringBoard's private classes.
@@ -18,10 +19,10 @@
 // We don't have Apple's real private headers for these, so the compiler
 // only knows about them as opaque forward-declared types unless we tell
 // it what they inherit from. Declaring them here as plain UIView /
-// UIViewController subclasses is enough for %hook, %property, and
-// %orig to work correctly — we're not redefining Apple's real class,
-// just describing its public shape (superclass) so Logos can generate
-// valid code against it.
+// UIViewController subclasses is enough for %hook and %orig to work
+// correctly — we're not redefining Apple's real class, just describing
+// its public shape (superclass) so Logos can generate valid code
+// against it.
 //
 // Adjust the superclass/name here to match whatever class you found
 // via class-dump for your target iOS version.
@@ -98,26 +99,34 @@
 // Hook: inject the glass view behind the notification shade's content,
 // and drive updateForPullProgress: from the shade's own pan gesture.
 //
-// Replace `CSCoverSheetView` / `_backgroundView` below with the actual
-// class + ivar/property names you find in your target iOS version.
+// We use an associated object (via objc/runtime.h) instead of a Logos
+// %property here. %property needs to generate a real property on the
+// hooked class, which runs into trouble when we only have a stub
+// @interface (no real private headers) — the associated object
+// approach sidesteps that entirely and always compiles.
+//
+// Replace `CSCoverSheetView` below with the actual class name you find
+// via class-dump for your target iOS version.
 // ---------------------------------------------------------------------
-%hook CSCoverSheetView
+static char kLGGlassViewKey;
 
-%property (nonatomic, strong) LGGlassView *lg_glassView;
+%hook CSCoverSheetView
 
 - (void)didMoveToWindow {
 	%orig;
-	if (self.window && !self.lg_glassView) {
+	LGGlassView *existing = objc_getAssociatedObject(self, &kLGGlassViewKey);
+	if (self.window && !existing) {
 		LGGlassView *glass = [[LGGlassView alloc] initWithFrame:self.bounds];
 		glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 		[self insertSubview:glass atIndex:0];
-		self.lg_glassView = glass;
+		objc_setAssociatedObject(self, &kLGGlassViewKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 	}
 }
 
 - (void)layoutSubviews {
 	%orig;
-	self.lg_glassView.frame = self.bounds;
+	LGGlassView *glass = objc_getAssociatedObject(self, &kLGGlassViewKey);
+	glass.frame = self.bounds;
 }
 
 %end
@@ -132,7 +141,7 @@
 	UIView *root = [self valueForKey:@"view"];
 	for (UIView *sub in root.subviews) {
 		if ([sub isKindOfClass:%c(CSCoverSheetView)]) {
-			LGGlassView *glass = [sub valueForKey:@"lg_glassView"];
+			LGGlassView *glass = objc_getAssociatedObject(sub, &kLGGlassViewKey);
 			[glass updateForPullProgress:percent];
 		}
 	}
