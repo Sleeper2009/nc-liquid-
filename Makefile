@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = LiquidGlassNC
 LiquidGlassNC_FILES = Tweak.xm
 LiquidGlassNC_CFLAGS = -fobjc-arc
-LiquidGlassNC_FRAMEWORKS = UIKit CoreGraphics QuartzCore
+LiquidGlassNC_FRAMEWORKS = UIKit CoreGraphics QuartzCore CoreImage
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
