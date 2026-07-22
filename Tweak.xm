@@ -14,6 +14,48 @@
 #import <objc/runtime.h>
 
 // ---------------------------------------------------------------------
+// Tiny file logger.
+//
+// Writes timestamped lines to /var/mobile/Documents/LiquidGlassNC.log
+// so you can check what happened even without a live syslog session.
+// This path lives outside the rootless prefix (/var/jb) so it's
+// reachable the same way on both rootful and rootless jailbreaks, and
+// is easy to grab with Filza or `scp`.
+//
+// View it with: tail -f /var/mobile/Documents/LiquidGlassNC.log
+// (over SSH), or open it in Filza / a text editor app.
+// ---------------------------------------------------------------------
+static NSString * const kLGLogPath = @"/var/mobile/Documents/LiquidGlassNC.log";
+
+static void LGLog(NSString *format, ...) {
+	va_list args;
+	va_start(args, format);
+	NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+	va_end(args);
+
+	static NSDateFormatter *formatter;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		formatter = [[NSDateFormatter alloc] init];
+		formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+	});
+	NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], msg];
+	NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+	@synchronized (kLGLogPath) {
+		if (![[NSFileManager defaultManager] fileExistsAtPath:kLGLogPath]) {
+			[[NSFileManager defaultManager] createFileAtPath:kLGLogPath contents:nil attributes:nil];
+		}
+		NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLGLogPath];
+		if (fh) {
+			[fh seekToEndOfFile];
+			[fh writeData:data];
+			[fh closeFile];
+		}
+	}
+}
+
+// ---------------------------------------------------------------------
 // Minimal stub interfaces for SpringBoard's private classes.
 //
 // We don't have Apple's real private headers for these, so the compiler
@@ -120,6 +162,7 @@ static char kLGGlassViewKey;
 		glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 		[self insertSubview:glass atIndex:0];
 		objc_setAssociatedObject(self, &kLGGlassViewKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		LGLog(@"[CSCoverSheetView] glass view attached, frame=%@", NSStringFromCGRect(self.bounds));
 	}
 }
 
@@ -138,17 +181,34 @@ static char kLGGlassViewKey;
 
 - (void)_updateRevealPercent:(CGFloat)percent {
 	%orig;
+	static BOOL warnedMissingSubview = NO;
+	static BOOL warnedMissingGlass = NO;
+
 	UIView *root = [self valueForKey:@"view"];
+	BOOL foundAny = NO;
 	for (UIView *sub in root.subviews) {
 		if ([sub isKindOfClass:%c(CSCoverSheetView)]) {
+			foundAny = YES;
 			LGGlassView *glass = objc_getAssociatedObject(sub, &kLGGlassViewKey);
+			if (!glass) {
+				if (!warnedMissingGlass) {
+					LGLog(@"[CSCoverSheetViewController] WARNING: found CSCoverSheetView but no glass view attached yet");
+					warnedMissingGlass = YES;
+				}
+				continue;
+			}
 			[glass updateForPullProgress:percent];
 		}
+	}
+	if (!foundAny && !warnedMissingSubview) {
+		LGLog(@"[CSCoverSheetViewController] WARNING: no CSCoverSheetView subview found — check class names for this iOS version");
+		warnedMissingSubview = YES;
 	}
 }
 
 %end
 
 %ctor {
+	LGLog(@"LiquidGlassNC loaded into %@", [[NSBundle mainBundle] bundleIdentifier]);
 	%init;
 }
